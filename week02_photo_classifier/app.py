@@ -1,33 +1,61 @@
-# 운영체제의 환경변수를 읽기 위한 기본 모듈
 import os
-
-# .env 파일의 값을 환경변수로 불러오는 함수
+import base64
+import shutil
+from pathlib import Path
 from dotenv import load_dotenv
-
-# OpenAI 호환 방식으로 Qwen API를 호출하는 클래스
 from openai import OpenAI
 
-# 현재 폴더의 .env 파일을 읽는다.
 load_dotenv()
 
-# .env에 저장한 API Key와 Endpoint로 Qwen 클라이언트를 만든다.
 client = OpenAI(
-    api_key=os.getenv("sk-ws-H.DDYRYDP.JjNL.MEUCIFGUkv-NkM9YkihD1gm0P2YgG2A1iak7xj7eFpOOJH5OAiEAx4Lo0aIwP0QSJSlhrqt4kyC6i4wbEUXXfXTDZ7PJ2Xc"),
-    base_url=os.getenv("https://ws-8her56jddi6nf65j.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1")
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+    base_url=os.getenv("DASHSCOPE_BASE_URL")
 )
 
-# qwen3.8-flash 모델에 짧은 테스트 메시지를 보낸다.
-response = client.chat.completions.create(
-    model="qwen3.8-flash",
-    messages=[
-        {
+LABELS = ["person", "document", "food", "device", "other"]
+INPUT_DIR = Path("input")
+OUTPUT_DIR = Path("sorted")
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
+def classify_image(image_path):
+    image_base64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+    suffix = image_path.suffix.lower()
+    mime_type = "image/png" if suffix == ".png" else "image/jpeg"
+
+    prompt = f"""
+Classify this photo for an automatic photo organization service.
+Choose exactly one category from: {', '.join(LABELS)}
+Return only the category name.
+"""
+
+    response = client.chat.completions.create(
+        model="qwen3.8-flash",
+        messages=[{
             "role": "user",
-            "content": "Say API connection successful."
-        }
-    ],
-    # 추론 과정 없이 최종 답변만 받는다.
-    extra_body={"enable_thinking": False}
-)
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime_type};base64,{image_base64}"
+                    }
+                },
+                {"type": "text", "text": prompt}
+            ]
+        }],
+        extra_body={"enable_thinking": False}
+    )
 
-# Qwen이 보낸 답변 내용을 터미널에 출력한다.
-print(response.choices[0].message.content)
+    category = response.choices[0].message.content.strip().lower()
+    return category if category in LABELS else "other"
+
+image_files = [
+    path for path in INPUT_DIR.iterdir()
+    if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+]
+
+for image_path in image_files:
+    category = classify_image(image_path)
+    category_dir = OUTPUT_DIR / category
+    category_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(image_path, category_dir / image_path.name)
+    print(f"{image_path.name} → {category}")
