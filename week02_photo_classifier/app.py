@@ -12,7 +12,7 @@ client = OpenAI(
     base_url=os.getenv("DASHSCOPE_BASE_URL")
 )
 
-LABELS = ["person", "document", "food", "device", "other"]
+LABELS = ["dog", "cat", "food", "device", "other","book"]
 INPUT_DIR = Path("input")
 OUTPUT_DIR = Path("sorted")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
