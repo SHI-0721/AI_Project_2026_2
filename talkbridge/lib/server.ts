@@ -43,8 +43,9 @@ const errorsJa: Record<string, string> = {
   ROOM_ENDED: "会話は終了しました。",
   AWAITING_APPROVAL: "ホストの参加承認をお待ちください。",
   HOST_ONLY: "音声を収録するホストだけがこの操作を行えます。",
+  GUEST_ONLY: "ホストが退出する場合は、会話を終了してください。",
   INVALID_STATE: "現在の状態ではこの操作を行えません。",
-  NOT_READY: "相手が承認済みでオンラインになっていることを確認してください。",
+  NOT_READY: "相手が参加してオンラインになっていることを確認してください。",
   INVALID_ACTION: "不明な操作です。",
   STALE_UPDATE: "状態が更新されています。もう一度お試しください。",
   CAPTION_LIMIT: "字幕数の上限に達しました。新しいルームを作成してください。",
@@ -157,23 +158,31 @@ export async function authorize(request: Request, id: unknown) {
     throw new ApiError(410, "ROOM_EXPIRED", "本次会话已到 30 分钟，请创建新房间。");
   }
   if (room.state === "running" && (room.host_seen_at < Date.now() - ONLINE_MS || !room.guest_seen_at || room.guest_seen_at < Date.now() - ONLINE_MS)) {
+    const tokenField = role === "host" ? "host_token_hash" : "guest_token_hash";
     await db().batch([
       db().prepare(`UPDATE rooms SET state='paused',generation=generation+1 WHERE id=? AND state='running'
-        AND (host_seen_at<? OR guest_seen_at IS NULL OR guest_seen_at<?)`)
-        .bind(id, Date.now() - ONLINE_MS, Date.now() - ONLINE_MS),
+        AND generation=? AND ${tokenField}=? AND (host_seen_at<? OR guest_seen_at IS NULL OR guest_seen_at<?)`)
+        .bind(id, room.generation, tokenHash, Date.now() - ONLINE_MS, Date.now() - ONLINE_MS),
       ...pausedCaptionCleanup(id),
     ]);
     room = (await db().prepare("SELECT * FROM rooms WHERE id=?").bind(id).first<RoomRow>())!;
+    if (!room || (role === "host" ? room.host_token_hash : room.guest_token_hash) !== tokenHash) {
+      throw new ApiError(403, "UNAUTHORIZED", "你已离开房间，请重新加入。");
+    }
   }
   return { room, role } as { room: RoomRow; role: "host" | "guest" };
 }
 
-async function snapshot(roomId: string, role: "host" | "guest"): Promise<RoomSnapshot> {
+async function snapshot(roomId: string, role: "host" | "guest", expectedGuestHash?: string | null): Promise<RoomSnapshot> {
   const room = await db().prepare("SELECT * FROM rooms WHERE id=?").bind(roomId).first<RoomRow>();
   if (!room) throw new ApiError(404, "ROOM_NOT_FOUND", "房间已关闭。");
+  if (role === "guest" && (!expectedGuestHash || room.guest_token_hash !== expectedGuestHash)) {
+    throw new ApiError(403, "UNAUTHORIZED", "你已离开房间，请重新加入。");
+  }
   const results = role === "guest" && room.guest_status !== "approved" ? [] :
-    (await db().prepare("SELECT * FROM captions WHERE room_id=? ORDER BY created_at,id LIMIT 400")
-      .bind(room.id).all<CaptionRow>()).results;
+    (await db().prepare(`SELECT captions.* FROM captions JOIN rooms ON rooms.id=captions.room_id
+      WHERE room_id=? AND (?='host' OR rooms.guest_token_hash=?) ORDER BY captions.created_at,captions.id LIMIT 400`)
+      .bind(room.id, role, expectedGuestHash || "").all<CaptionRow>()).results;
   return {
     id: room.id, code: room.code, state: room.state, mode: room.mode,
     hostLanguage: room.host_language, guestLanguage: room.guest_language, guestStatus: room.guest_status,
@@ -191,8 +200,17 @@ async function snapshot(roomId: string, role: "host" | "guest"): Promise<RoomSna
 export async function getRoom(request: Request) {
   const { room, role } = await authorize(request, new URL(request.url).searchParams.get("roomId"));
   const field = role === "host" ? "host_seen_at" : "guest_seen_at";
-  await db().prepare(`UPDATE rooms SET ${field}=? WHERE id=?`).bind(Date.now(), room.id).run();
-  return response({ room: await snapshot(room.id, role) });
+  const tokenField = role === "host" ? "host_token_hash" : "guest_token_hash";
+  const updated = await db().prepare(`UPDATE rooms SET ${field}=? WHERE id=? AND ${tokenField}=?`)
+    .bind(Date.now(), room.id, role === "host" ? room.host_token_hash : room.guest_token_hash).run();
+  if (!updated.meta.changes) throw new ApiError(403, "UNAUTHORIZED", "你已离开房间，请重新加入。");
+  // Existing V0.1 guests can resume with their token without a now-removed approval step.
+  if (role === "guest" && room.guest_status === "pending") {
+    await db().prepare(`UPDATE rooms SET guest_status='approved',state='ready',generation=generation+1
+      WHERE id=? AND guest_status='pending' AND guest_token_hash=? AND state IN ('waiting','ready')`)
+      .bind(room.id, room.guest_token_hash).run();
+  }
+  return response({ room: await snapshot(room.id, role, room.guest_token_hash) });
 }
 
 export async function postRoom(request: Request) {
@@ -220,15 +238,30 @@ export async function postRoom(request: Request) {
     if (!room) throw new ApiError(404, "ROOM_NOT_FOUND", "房间不存在或已经结束。");
     if (room.host_language === lang) throw new ApiError(400, "SAME_LANGUAGE", "双方需要选择不同语言。");
     const rawToken = token();
-    const result = await db().prepare(`UPDATE rooms SET guest_token_hash=?,guest_language=?,guest_status='pending',guest_seen_at=?,generation=generation+1
-      WHERE id=? AND guest_status='none' AND state!='ended' AND expires_at>?`)
-      .bind(await hash(rawToken), lang, Date.now(), room.id, Date.now()).run();
+    const guestHash = await hash(rawToken);
+    const result = await db().prepare(`UPDATE rooms SET guest_token_hash=?,guest_language=?,guest_status='approved',state='ready',guest_seen_at=?,generation=generation+1
+      WHERE id=? AND guest_status='none' AND state IN ('waiting','ready','paused') AND expires_at>?`)
+      .bind(guestHash, lang, Date.now(), room.id, Date.now()).run();
     if (!result.meta.changes) throw new ApiError(409, "ROOM_FULL", "房间已有另一位参与者或待确认的加入请求。");
     const session: Session = { roomId: room.id, token: rawToken, role: "guest", language: lang, code: room.code };
-    return response({ session, room: await snapshot(room.id, "guest") });
+    return response({ session, room: await snapshot(room.id, "guest", guestHash) });
   }
   const { room, role } = await authorize(request, input.roomId);
   if (room.state === "ended") throw new ApiError(409, "ROOM_ENDED", "对话已经结束。");
+  if (input.action === "leave") {
+    if (role !== "guest") throw new ApiError(403, "GUEST_ONLY", "房主离开请结束对话。");
+    const results = await db().batch([
+      db().prepare(`UPDATE rooms SET guest_token_hash=NULL,guest_language=NULL,guest_status='none',guest_seen_at=NULL,
+        state='waiting',generation=generation+1,demo_index=0,started_at=NULL,last_translation_at=0
+        WHERE id=? AND guest_token_hash=? AND state!='ended'`)
+        .bind(room.id, room.guest_token_hash),
+      // A new participant must not receive the previous participant's transcript.
+      db().prepare(`DELETE FROM captions WHERE room_id=? AND EXISTS(
+        SELECT 1 FROM rooms WHERE id=? AND guest_status='none' AND state='waiting')`).bind(room.id, room.id),
+    ]);
+    if (!results[0].meta.changes) throw new ApiError(409, "INVALID_STATE", "加入状态已改变，请重新连接。");
+    return response({ left: true });
+  }
   if (input.action === "cancel-join") {
     if (role !== "guest" || room.guest_status !== "pending") throw new ApiError(409, "INVALID_STATE", "只有待确认的参与者可以取消加入。");
     const result = await db().prepare(`UPDATE rooms SET guest_token_hash=NULL,guest_language=NULL,guest_status='none',guest_seen_at=NULL,generation=generation+1
@@ -239,6 +272,8 @@ export async function postRoom(request: Request) {
   }
   if (role === "guest" && room.guest_status !== "approved") throw new ApiError(403, "AWAITING_APPROVAL", "请等待房主确认加入。");
   await rateLimit("room:" + room.id, 200, 60_000);
+  const tokenField = role === "host" ? "host_token_hash" : "guest_token_hash";
+  const tokenHash = role === "host" ? room.host_token_hash : room.guest_token_hash;
   if (["approve", "reject", "start", "caption", "discard-caption", "demo-next"].includes(String(input.action)) && role !== "host") {
     throw new ApiError(403, "HOST_ONLY", "只有收音端可以执行此操作。");
   }
@@ -263,14 +298,17 @@ export async function postRoom(request: Request) {
     }
     case "pause":
       await db().batch([
-        db().prepare("UPDATE rooms SET state='paused',generation=generation+1 WHERE id=? AND state='running'").bind(room.id),
+        db().prepare(`UPDATE rooms SET state='paused',generation=generation+1 WHERE id=? AND state='running' AND generation=? AND ${tokenField}=?`)
+          .bind(room.id, room.generation, tokenHash),
         ...pausedCaptionCleanup(room.id),
       ]);
       break;
     case "end":
       await db().batch([
-        db().prepare("UPDATE rooms SET state='ended',generation=generation+1 WHERE id=?").bind(room.id),
-        db().prepare("DELETE FROM captions WHERE room_id=?").bind(room.id),
+        db().prepare(`UPDATE rooms SET state='ended',generation=generation+1 WHERE id=? AND generation=? AND ${tokenField}=?`)
+          .bind(room.id, room.generation, tokenHash),
+        db().prepare(`DELETE FROM captions WHERE room_id=? AND EXISTS(SELECT 1 FROM rooms WHERE id=? AND state='ended' AND ${tokenField}=?)`)
+          .bind(room.id, room.id, tokenHash),
       ]);
       break;
     case "demo-next":
@@ -291,7 +329,7 @@ export async function postRoom(request: Request) {
     default:
       throw new ApiError(400, "INVALID_ACTION", "未知操作。");
   }
-  return response({ room: await snapshot(room.id, role) });
+  return response({ room: await snapshot(room.id, role, room.guest_token_hash) });
 }
 
 const demoLines: [Language, string, string][] = [
@@ -346,7 +384,7 @@ async function saveCaption(room: RoomRow, input: Input) {
   if (!changed.meta.changes) return;
   // ponytail: one translation stream per room; isolate streams when multi-microphone mode is added.
   const claimed = await db().prepare("UPDATE rooms SET last_translation_at=? WHERE id=? AND (last_translation_at<? OR ?=1)")
-    .bind(Date.now(), room.id, Date.now() - 1500, input.isFinal ? 1 : 0).run();
+    .bind(Date.now(), room.id, Date.now() - 700, input.isFinal ? 1 : 0).run();
   if (!claimed.meta.changes) return;
   let translated = "", state: "done" | "error" = "done";
   try {
