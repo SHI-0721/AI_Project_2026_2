@@ -1,0 +1,6 @@
+# Copy these four lines to .dev.vars for local use; never commit the filled file.
+# For the hosted Site, configure the same names in server runtime secrets.
+AZURE_SPEECH_KEY="replace-with-your-speech-key"
+AZURE_SPEECH_REGION="japaneast"
+AZURE_TRANSLATOR_KEY="replace-with-your-translator-key"
+AZURE_TRANSLATOR_REGION="replace-with-your-translator-resource-region"
