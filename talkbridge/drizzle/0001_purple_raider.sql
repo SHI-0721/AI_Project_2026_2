@@ -1,0 +1,1 @@
+ALTER TABLE `captions` ADD `edited` integer DEFAULT 0 NOT NULL;
