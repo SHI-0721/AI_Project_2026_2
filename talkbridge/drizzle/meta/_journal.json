@@ -8,6 +8,27 @@
       "when": 1792828241499,
       "tag": "0000_confused_black_panther",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1792863835944,
+      "tag": "0001_purple_raider",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1792866774007,
+      "tag": "0002_third_ikaris",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1792950068234,
+      "tag": "0003_melted_captain_marvel",
+      "breakpoints": true
     }
   ]
 }

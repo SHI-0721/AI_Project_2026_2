@@ -26,9 +26,10 @@ try {
   if (!config.speechReady) {
     assert.equal((await api("create", { language: "zh", mode: "live" })).code, "SPEECH_NOT_CONFIGURED");
   }
-  const invalidLanguage = await api("create", { language: "en", mode: "demo" });
+  const invalidLanguage = await api("create", { language: "fr", mode: "demo" });
   assert.equal(invalidLanguage.status, 400);
   assert.ok(invalidLanguage.errorJa.length > 0);
+  assert.ok(invalidLanguage.errorKo.length > 0);
   const created = await api("create", { language: "zh", mode: "demo" });
   assert.equal(created.status, 201);
   const host = created.session;
@@ -89,6 +90,14 @@ try {
   assert.equal(complete.captions[0].revision, 2);
   assert.ok(complete.captions[0].translation.length > 0);
   assert.deepEqual((await poll(guest)).room.captions, complete.captions);
+  assert.equal((await api("edit-caption", { id: "demo-0", revision: 2, text: "修正权限测试" }, host)).code, "CAPTION_OWNER_ONLY");
+  const edited = await api("edit-caption", { id: "demo-0", revision: 2, text: "今日はありがとうございます。" }, guest);
+  assert.equal(edited.status, 200);
+  assert.equal(edited.room.captions[0].edited, true);
+  assert.equal(edited.room.captions[0].revision, 3);
+  assert.match(edited.room.captions[0].translation, /演示/);
+  assert.deepEqual((await poll(host)).room.captions, edited.room.captions);
+  assert.equal((await api("edit-caption", { id: "demo-0", revision: 2, text: "古い修正" }, guest)).code, "STALE_UPDATE");
   assert.equal((await api("demo-next", { expectedDemoIndex: 0 }, host)).code, "STALE_UPDATE");
   assert.equal((await api("caption", { id: "arbitrary", revision: 1, sourceLanguage: "zh", text: "Not allowed", isFinal: true }, host)).code, "INVALID_STATE");
   assert.equal((await api("discard-caption", { id: "demo-0", generation: complete.generation }, guest)).code, "HOST_ONLY");
@@ -124,7 +133,23 @@ try {
   assert.equal((await poll(host)).room.captions.length, 0);
   assert.equal((await api("start", {}, host)).code, "ROOM_ENDED");
   assert.equal((await api("join", { code: host.code, language: "ja" })).status, 404);
-  console.log("PASS: configuration boundary, direct/concurrent joins, role checks, room isolation, partial/final updates, dual-client sync, pause/resume, leave/rejoin, end cleanup.");
+  for (const partner of ["zh", "ja"]) {
+    const korean = await api("create", { language: "ko", mode: "demo" });
+    assert.equal(korean.status, 201);
+    sessions.push(korean.session);
+    const partnerJoin = await api("join", { code: korean.session.code, language: partner });
+    assert.equal(partnerJoin.status, 200);
+    await api("start", {}, korean.session);
+    for (let index = 0; index < 4; index++) assert.equal((await api("demo-next", { expectedDemoIndex: index }, korean.session)).status, 200);
+    const pair = (await poll(korean.session)).room;
+    assert.deepEqual(pair.captions.map(c => c.sourceLanguage), [partner, "ko"]);
+    const correction = await api("edit-caption", { id: "demo-1", revision: 2, text: "내일 오후 네 시에 만나요." }, korean.session);
+    assert.equal(correction.status, 200);
+    assert.equal(correction.room.captions[1].text, "내일 오후 네 시에 만나요.");
+    assert.deepEqual((await poll(partnerJoin.session)).room.captions, correction.room.captions);
+    await api("end", {}, korean.session);
+  }
+  console.log("PASS: language pairs including Korean, correction permissions/sync, configuration boundary, direct/concurrent joins, room isolation, partial/final updates, pause/resume, leave/rejoin, end cleanup.");
 } finally {
   for (const session of sessions) await api("end", {}, session).catch(() => {});
 }
